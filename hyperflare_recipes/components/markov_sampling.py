@@ -133,9 +133,9 @@ def _row_live(
 
 
 @triton.jit
-def _transition_bias(Embed, Head, HeadScale, row, token, inside,
+def _transition_bias(Embed, EmbedScale, Head, HeadScale, row, token, inside,
                      RANK: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
-                     FP8: tl.constexpr):
+                     FP8: tl.constexpr, EMBED_FP8: tl.constexpr):
     bias = tl.full((BLOCK,), 0.0, tl.float32)
     for start in tl.static_range(0, RANK, CHUNK):
         column = start + tl.arange(0, CHUNK)
@@ -145,7 +145,69 @@ def _transition_bias(Embed, Head, HeadScale, row, token, inside,
         bias += tl.sum(weights * embedding[None, :], 1)
     if FP8:
         bias *= tl.load(HeadScale + token, inside, other=0.0).to(tl.float32)
+    if EMBED_FP8:
+        bias *= tl.load(EmbedScale + row).to(tl.float32)
     return bias
+
+
+@triton.jit
+def _row_scaled_embedding_kernel(Tokens, Values, Scale, Output, V: tl.constexpr,
+                                 RANK: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    tok = tl.minimum(tl.maximum(tl.load(Tokens + row), 0), V - 1)
+    scale = tl.load(Scale + tok).to(tl.float32)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < RANK
+    vals = tl.load(Values + tok.to(tl.int64) * RANK + cols, mask, other=0.0).to(tl.float32)
+    tl.store(Output + row.to(tl.int64) * RANK + cols, (vals * scale).to(tl.bfloat16), mask)
+
+
+class PreparedRowScaledFP8MarkovEmbedding:
+    """Gather token rows from row-scaled E4M3 Markov embeddings into BF16."""
+
+    def __init__(self, weight: RowScaledFP8MarkovWeight, ids, output, *, session, name):
+        if (not isinstance(weight, RowScaledFP8MarkovWeight)
+                or output.ndim != 2 or output.dtype != torch.bfloat16 or not output.is_contiguous()
+                or output.shape[1] != weight.in_features or output.device != weight.values.device):
+            raise ValueError("row-scaled FP8 Markov embedding requires contiguous BF16 [rows, rank] output")
+        self.weight, self.ids, self.output = weight, ids, output
+        self.kernel = None
+        self._dynamic_inputs = False
+        record_numeric_tensor(weight.values)
+        record_numeric_tensor(weight.scale)
+        register_finalizer(session, self.prepare)
+
+    def prepare(self):
+        weight = self.weight
+        self.kernel = prepare_triton(_row_scaled_embedding_kernel,
+            (self.ids, weight.values, weight.scale, self.output),
+            (self.output.shape[0], 1, 1),
+            V=weight.out_features, RANK=weight.in_features,
+            BLOCK=triton.next_power_of_2(weight.in_features),
+            num_warps=4, enable_fp_fusion=False)
+
+    def functional(self, *, session, dynamic_inputs=False):
+        self.output_layout = (tuple(self.output.shape), self.output.dtype)
+        self._dynamic_inputs = bool(dynamic_inputs)
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.kernel.args = (None, self.weight.values, self.weight.scale, None)
+        if self._dynamic_inputs:
+            self.ids = None
+        self.output = None
+
+    def __call__(self, ids=None, *, token_ids=None):
+        if self.kernel is None:
+            raise RuntimeError("row-scaled FP8 Markov embedding requires preparation")
+        ids = self.ids if token_ids is None and ids is None else (token_ids if token_ids is not None else ids)
+        shape, dtype = self.output_layout
+        output = torch.empty(shape, dtype=dtype, device=ids.device)
+        op = self.kernel
+        launch_triton(op.kernel, op.compiled,
+            (ids, self.weight.values, self.weight.scale, output), op.grid, **op.options)
+        return output
 
 
 @triton.jit
@@ -154,8 +216,8 @@ def _row_scaled_projection(Source, Head, HeadScale, Output, V: tl.constexpr,
     block, row = tl.program_id(0), tl.program_id(1)
     token = block * BLOCK + tl.arange(0, BLOCK)
     inside = token < V
-    bias = _transition_bias(Source, Head, HeadScale, row, token, inside,
-                            RANK, CHUNK, BLOCK, True)
+    bias = _transition_bias(Source, Source, Head, HeadScale, row, token, inside,
+                            RANK, CHUNK, BLOCK, True, False)
     tl.store(Output + row * V + token, bias, inside)
 
 
@@ -448,6 +510,7 @@ def _normalize_fast(
 def _markov_step_batched(
     Base,
     Embed,
+    EmbedScale,
     Head,
     HeadScale,
     Pending,
@@ -487,6 +550,7 @@ def _markov_step_batched(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    EMBED_FP8: tl.constexpr,
 ):
     block = tl.program_id(0)
     r0 = tl.program_id(1) * 2
@@ -530,6 +594,9 @@ def _markov_step_batched(
         scale = tl.load(HeadScale + token, inside, other=0.0).to(tl.float32)
         b0 *= scale
         b1 *= scale
+    if EMBED_FP8:
+        b0 *= tl.load(EmbedScale + p0).to(tl.float32)
+        b1 *= tl.load(EmbedScale + p1).to(tl.float32)
     _finish_markov_row(
         r0, p0, b0, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
@@ -548,6 +615,7 @@ def _markov_step_batched(
 def _markov_step_batched4(
     Base,
     Embed,
+    EmbedScale,
     Head,
     HeadScale,
     Pending,
@@ -587,6 +655,7 @@ def _markov_step_batched4(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    EMBED_FP8: tl.constexpr,
 ):
     block = tl.program_id(0)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -655,6 +724,11 @@ def _markov_step_batched4(
         b1 *= scale
         b2 *= scale
         b3 *= scale
+    if EMBED_FP8:
+        b0 *= tl.load(EmbedScale + p0).to(tl.float32)
+        b1 *= tl.load(EmbedScale + p1).to(tl.float32)
+        b2 *= tl.load(EmbedScale + p2).to(tl.float32)
+        b3 *= tl.load(EmbedScale + p3).to(tl.float32)
     _finish_markov_row(
         0, p0, b0, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
@@ -685,6 +759,7 @@ def _markov_step_batched4(
 def _markov_step_batched8(
     Base,
     Embed,
+    EmbedScale,
     Head,
     HeadScale,
     Pending,
@@ -724,6 +799,7 @@ def _markov_step_batched8(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    EMBED_FP8: tl.constexpr,
 ):
     block = tl.program_id(0)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -807,6 +883,8 @@ def _markov_step_batched8(
                 p6 if r_idx == 6 else p7))))))
             )
             br = tl.sum(tl.where((cols == r_idx)[None, :], acc, 0.0), axis=1)
+            if EMBED_FP8:
+                br *= tl.load(EmbedScale + pr).to(tl.float32)
             _finish_markov_row(
                 r_idx, pr, br, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
                 Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
@@ -824,7 +902,8 @@ def _markov_step_batched8(
                 p5 if r_idx == 5 else (
                 p6 if r_idx == 6 else p7))))))
             )
-            br = _transition_bias(Embed, Head, HeadScale, pr, token, inside, RANK, CHUNK, BLOCK, FP8)
+            br = _transition_bias(Embed, EmbedScale, Head, HeadScale, pr, token, inside,
+                                  RANK, CHUNK, BLOCK, FP8, EMBED_FP8)
             _finish_markov_row(
                 r_idx, pr, br, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
                 Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
@@ -837,6 +916,7 @@ def _markov_step_batched8(
 def _markov_step(
     Base,
     Embed,
+    EmbedScale,
     Head,
     HeadScale,
     Pending,
@@ -876,6 +956,7 @@ def _markov_step(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    EMBED_FP8: tl.constexpr,
 ):
     block, row = tl.program_id(0), tl.program_id(1)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -914,9 +995,11 @@ def _markov_step(
         bias = tl.sum(tl.where(c0[None, :], acc, 0.0), axis=1)
         if FP8:
             bias *= tl.load(HeadScale + token, inside, other=0.0).to(tl.float32)
+        if EMBED_FP8:
+            bias *= tl.load(EmbedScale + previous).to(tl.float32)
     else:
-        bias = _transition_bias(Embed, Head, HeadScale, previous, token, inside,
-                                RANK, CHUNK, BLOCK, FP8)
+        bias = _transition_bias(Embed, EmbedScale, Head, HeadScale, previous, token, inside,
+                                RANK, CHUNK, BLOCK, FP8, EMBED_FP8)
     score = (
         tl.load(Base + row * base_row_stride + STEP * base_step_stride + token, inside, other=0.0).to(tl.float32) + bias
     )
@@ -1073,20 +1156,24 @@ class PreparedMarkovProposals:
         fp8 = isinstance(head, RowScaledFP8MarkovWeight)
         values = head.values if fp8 else head
         scale = head.scale if fp8 else None
+        embed_fp8 = isinstance(embedding, RowScaledFP8MarkovWeight)
+        embed_values = embedding.values if embed_fp8 else embedding
+        embed_scale = embedding.scale if embed_fp8 else None
         if (
             base.dtype not in (torch.bfloat16, torch.float32)
             or base.stride(-1) != 1
             or not 1 <= depth < (1 << 31) - 1
             or not isinstance(values, torch.Tensor)
-            or embedding.shape != values.shape
+            or not isinstance(embed_values, torch.Tensor)
+            or embed_values.shape != values.shape
             or values.shape[0] != vocab
             or values.shape[1] % 64
             or values.dtype != (torch.float8_e4m3fn if fp8 else torch.bfloat16)
-            or embedding.dtype != torch.bfloat16
+            or embed_values.dtype != (torch.float8_e4m3fn if embed_fp8 else torch.bfloat16)
             or not values.is_contiguous()
-            or not embedding.is_contiguous()
+            or not embed_values.is_contiguous()
             or values.device != base.device
-            or embedding.device != base.device
+            or embed_values.device != base.device
             or base.stride(1) < vocab
             or base.stride(0) < available * base.stride(1)
         ):
@@ -1106,7 +1193,11 @@ class PreparedMarkovProposals:
         ):
             _tensor(tensor, shape, dtype, base.device, name)
         self.base, self.embedding, self.head, self.pending = (base, embedding, head, pending)
+        self.embed_values, self.embed_scale = embed_values, embed_scale
         self.head_values, self.head_scale = values, scale
+        if embed_fp8:
+            record_numeric_tensor(embed_values)
+            record_numeric_tensor(embed_scale)
         if fp8:
             record_numeric_tensor(values)
             record_numeric_tensor(scale)
@@ -1138,6 +1229,7 @@ class PreparedMarkovProposals:
             BLOCK=block,
             CHUNK=chunk,
             FP8=self.head_scale is not None,
+            EMBED_FP8=self.embed_scale is not None,
             num_warps=step_warps,
             enable_fp_fusion=False,
         )
@@ -1196,7 +1288,8 @@ class PreparedMarkovProposals:
                 step_kernel,
                 (
                     self.base,
-                    self.embedding,
+                    self.embed_values,
+                    self.embed_values if self.embed_scale is None else self.embed_scale,
                     self.head_values,
                     self.head_values if self.head_scale is None else self.head_scale,
                     self.pending,
@@ -1325,7 +1418,7 @@ class PreparedMarkovProposals:
             if rop is not None:
                 rop.args = tuple(None if index < 6 else value for index, value in enumerate(rop.args))
         for kernel in self.step_ops:
-            kernel.args = tuple(None if index in (0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+            kernel.args = tuple(None if index in (0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
                                 else value for index, value in enumerate(kernel.args))
         if self.reduce_lse_op is not None:
             self.reduce_lse_op.args = tuple(
@@ -1349,8 +1442,8 @@ class PreparedMarkovProposals:
                              scratch["maxima"][before], scratch["arguments"][before])
                 launch_triton(rop.kernel, rop.compiled, tuple(rargs), rop.grid, **rop.options)
             args = list(operation.args)
-            args[0], args[4], args[5], args[6] = base, pending, tokens, probabilities
-            args[7:16] = (scratch["lse_max"], scratch["lse_sum"], scratch["bad"],
+            args[0], args[5], args[6], args[7] = base, pending, tokens, probabilities
+            args[8:17] = (scratch["lse_max"], scratch["lse_sum"], scratch["bad"],
                 scratch["maxima"][before], scratch["arguments"][before],
                 scratch["maxima"][after], scratch["arguments"][after], seeds, offsets)
             launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)

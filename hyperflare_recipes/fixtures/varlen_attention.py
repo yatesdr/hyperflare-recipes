@@ -37,9 +37,22 @@ class AttentionBenchmarkInputs:
                 restored.add(storage)
 
 
-def attention_benchmark_inputs(arguments):
+def _ranges_disjoint(tensor_a, byte_start_a, byte_end_a, tensor_b):
+    if tensor_b is None or tensor_b.device != tensor_a.device:
+        return True
+    base_a = tensor_a.untyped_storage().data_ptr()
+    lo_a, hi_a = base_a + byte_start_a, base_a + byte_end_a
+    base_b = tensor_b.untyped_storage().data_ptr()
+    b_elems = 1 + sum((s - 1) * st for s, st in zip(tensor_b.shape, tensor_b.stride(), strict=True)) if tensor_b.numel() else 0
+    lo_b = base_b + tensor_b.storage_offset() * tensor_b.element_size()
+    hi_b = lo_b + b_elems * tensor_b.element_size()
+    return hi_a <= lo_b or hi_b <= lo_a
+
+
+def attention_benchmark_inputs(arguments, *, reuse_disposable=False):
     """Private finite QKV and one full-capacity image for attention tuning."""
     query = arguments["q"]
+    out = arguments.get("out")
     generator = torch.Generator(device=query.device).manual_seed(89017)
     result, groups = {}, {}
     for name in ("q", "k", "v"):
@@ -52,7 +65,25 @@ def attention_benchmark_inputs(arguments):
                    for size, stride in zip(source.shape, source.stride(), strict=True))
                    for _, source in operands)
         source = operands[0][1]
-        backing = torch.zeros(last - first, dtype=source.dtype, device=source.device)
+        byte_start = first * source.element_size()
+        byte_end = last * source.element_size()
+        need_bytes = byte_end - byte_start
+        borrow = False
+        if reuse_disposable and source.is_cuda and _ranges_disjoint(source, byte_start, byte_end, out):
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(source.device)
+            except Exception:
+                free_bytes = None
+            if free_bytes is not None and free_bytes < need_bytes + (256 << 20):
+                borrow = True
+        if borrow:
+            slice_storage = source.untyped_storage()[byte_start:byte_end]
+            backing = torch.empty(0, dtype=source.dtype, device=source.device).set_(
+                slice_storage, 0, (last - first,)
+            )
+            backing.zero_()
+        else:
+            backing = torch.zeros(last - first, dtype=source.dtype, device=source.device)
         for name, source in operands:
             value = backing.as_strided(source.shape, source.stride(), source.storage_offset() - first)
             result[name] = value
@@ -75,7 +106,7 @@ def attention_benchmark_inputs(arguments):
 def input_factory(arguments, *, storage=None, session=None):
     def allocate():
         with (nullcontext() if storage is None else storage.transient()):
-            return attention_benchmark_inputs(arguments)
+            return attention_benchmark_inputs(arguments, reuse_disposable=storage is not None)
 
     return candidate_inputs(allocate, session=session)
 

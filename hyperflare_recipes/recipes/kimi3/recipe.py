@@ -4,10 +4,118 @@
 
 """Kimi K3 MXFP4-CSF preparation capacities and serving defaults."""
 
+from dataclasses import replace
+import json
 from pathlib import Path
 from types import MappingProxyType
 
 from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+
+
+def _exl3_quantization(metadata: Path) -> tuple[dict, dict] | None:
+    config_path = metadata / "config.json"
+    if not config_path.is_file():
+        return None
+    raw = json.loads(config_path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("checkpoint configuration must be an object")
+    text = raw.get("text_config", {})
+    quant = text.get("quantization_config") if isinstance(text, dict) else None
+    if not isinstance(quant, dict) or quant.get("quant_method") != "exl3":
+        return None
+    if not isinstance(quant.get("exl3"), dict) or quant["exl3"].get("manifest") != "exl3-manifest.json":
+        raise ValueError("EXL3 requires exl3-manifest.json")
+    return raw, quant
+
+
+def _exl3_files(metadata: Path, quant: dict) -> tuple[str, ...]:
+    manifest_name = quant["exl3"]["manifest"]
+    manifest = json.loads((metadata / manifest_name).read_text())
+    if (not isinstance(manifest, dict) or manifest.get("schema") != "exl3-v1"
+            or manifest.get("kind") != "exl3-manifest"):
+        raise ValueError("unsupported EXL3 expert manifest")
+    layers = manifest.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        raise ValueError("EXL3 manifest has no expert layers")
+    if not all(isinstance(ref, dict) for ref in layers.values()):
+        raise ValueError("EXL3 layer references must be objects")
+    files = tuple(ref.get("file") for ref in layers.values())
+    if any(not isinstance(name, str) or not name.endswith(".safetensors") or Path(name).name != name
+           for name in files):
+        raise ValueError("EXL3 expert filenames must be local safetensors basenames")
+    if len(set(files)) != len(files):
+        raise ValueError("EXL3 expert layer files must be distinct")
+    return files
+
+
+def _exl3_stored_bytes(metadata: Path, quant: dict, base_stored_bytes: int) -> int:
+    total = quant["exl3"].get("weight_file_bytes")
+    if total is not None:
+        if type(total) is not int or total <= base_stored_bytes:
+            raise ValueError("EXL3 weight_file_bytes must be an integer larger than safetensors total_size")
+        return total
+    index = json.loads((metadata / "model.safetensors.index.json").read_text())
+    files = set(index["weight_map"].values()) | set(_exl3_files(metadata, quant))
+    return sum((metadata / name).stat().st_size for name in files)
+
+
+def _exl3_mxfp8_savings(raw: dict) -> dict[str, int]:
+    """Estimate Kimi's aligned KDA/attention/shared projection savings by scope for EXL3 checkpoints."""
+    c = raw.get("text_config", {})
+    if not isinstance(c, dict):
+        return {}
+    hidden, layers = c["hidden_size"], c["num_hidden_layers"]
+    linear = c["linear_attn_config"]
+    kda_columns = linear["num_heads"] * 128
+    attention_columns = c["num_attention_heads"] * 128
+    kda_layers = len(linear["kda_layers"])
+    kda_input_elements = kda_layers * hidden * (4 * kda_columns + 128 + linear["num_heads"])
+    kda_all_elements = kda_input_elements + kda_layers * hidden * kda_columns
+    all_elements = hidden * (3 * kda_layers * kda_columns
+        + 2 * (kda_layers * kda_columns + (layers - kda_layers) * attention_columns)
+        + 3 * (layers - c["first_k_dense_replace"]) * c["num_shared_experts"] * c["moe_intermediate_size"])
+    return {
+        "kda-input": 2 * kda_input_elements * 7 // 16,
+        "kda-all": 2 * kda_all_elements * 7 // 16,
+        "all": 2 * all_elements * 3 // 8,
+    }
+
+
+def _replicated_dsa_indexer_bytes(raw: dict) -> int:
+    """Per-rank BF16 byte size of replicated DSA indexer weights, or 0 for non-DSA checkpoints."""
+    c = raw.get("text_config", {})
+    if not isinstance(c, dict) or not c.get("index_n_heads"):
+        return 0
+    linear = c.get("linear_attn_config", {})
+    kda_layers = len(linear.get("kda_layers", ())) if isinstance(linear, dict) else 0
+    dsa_layers = max(0, int(c["num_hidden_layers"]) - kda_layers)
+    heads, dim = int(c["index_n_heads"]), int(c["index_head_dim"])
+    hidden, q_lora = int(c["hidden_size"]), int(c["q_lora_rank"])
+    return dsa_layers * 2 * (heads * dim * q_lora + dim * hidden + heads * hidden + 2 * dim)
+
+
+def _inspect_exl3_replacement(metadata: Path, replacement: Checkpoint) -> Checkpoint | None:
+    """Size an unregistered Kimi EXL3 checkpoint and reject incompatible expert scale compression."""
+    parsed = _exl3_quantization(metadata)
+    if parsed is None:
+        return None
+    raw, quant = parsed
+    manifest_path = metadata / quant["exl3"]["manifest"]
+    if manifest_path.is_file():
+        _exl3_files(metadata, quant)
+    stored = _exl3_stored_bytes(metadata, quant, replacement.stored_bytes)
+    savings = _exl3_mxfp8_savings(raw)
+    # Indexer tensors are replicated on every rank without sharding; stored counts one copy.
+    extra_replicated_indexer = 7 * _replicated_dsa_indexer_bytes(raw)
+    return replace(
+        replacement,
+        stored_bytes=stored,
+        device_bytes=stored + extra_replicated_indexer + replacement.draft_bytes,
+        mapped_host_bytes=0,
+        expansion_bytes=0,
+        scale_compressed_device_bytes={},
+        online_mxfp8_scope_savings_bytes=savings,
+    )
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -90,7 +198,8 @@ RECIPE = Recipe(
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.
-    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"),
+    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input", "kda-all"),
+    inspect_replacement=_inspect_exl3_replacement,
     # Decode and verification run each MoE layer's shared experts beside its routing and routed experts.
     stream_overlap=True,
     # Text-only plans, as vLLM serves Kimi K3 with --language-model-only, leave the MoonViT encoder unloaded.

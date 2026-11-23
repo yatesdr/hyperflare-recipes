@@ -24,7 +24,7 @@ from ignition.components.collectives import PreparedAllGather, PreparedChunkedAl
 from hyperflare_recipes.components.head_exchange import PreparedLseReduceScatter
 from hyperflare_recipes.components.dense_mla import PreparedDenseMLA
 from hyperflare_recipes.components.linear import BatchedUnquantizedProjection
-from ignition.preparation.examples import declaration_tensor
+from .examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tuning import register_finalizer
 

@@ -25,9 +25,9 @@ class AttentionConstants:
     scale: torch.Tensor
 
     @classmethod
-    def allocate(cls, device, *, query_capacity=PREFILL_ROWS):
-        return cls(torch.arange(PREFILL_ROWS * TOPK, dtype=torch.int32, device=device).view(PREFILL_ROWS, TOPK),
-                   torch.arange(max(PREFILL_ROWS, query_capacity) + 1, dtype=torch.int32, device=device),
+    def allocate(cls, device, *, query_capacity=PREFILL_ROWS, prefill_rows=PREFILL_ROWS):
+        return cls(torch.arange(prefill_rows * TOPK, dtype=torch.int32, device=device).view(prefill_rows, TOPK),
+                   torch.arange(max(prefill_rows, query_capacity) + 1, dtype=torch.int32, device=device),
                    torch.ones(1, dtype=torch.float32, device=device))
 
 
@@ -57,6 +57,7 @@ class ContextParallel:
     published_candidates: object = None
     selection_tuning: object = None
     groups: tuple = ()
+    prefill_rows: int = PREFILL_ROWS
 
 
 def index_pages(model_pages, output):

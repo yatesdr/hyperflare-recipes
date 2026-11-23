@@ -18,6 +18,16 @@ from b12x.comm.pcie._island_rs_cute import (
 )
 from b12x.comm.pcie._island_v4_mix import get_island_mix7168_launcher
 try:
+    from b12x.comm.pcie._tp8_ro_fused_cute import (
+        get_tp8_ro_mix7168_launcher,
+        get_tp8_ro_norm3584_launcher,
+        get_tp8_ro_resnorm7168_launcher,
+    )
+except ImportError:
+    get_tp8_ro_mix7168_launcher = None
+    get_tp8_ro_norm3584_launcher = None
+    get_tp8_ro_resnorm7168_launcher = None
+try:
     from b12x.comm.pcie._island_v4_wide import (
         get_island_mix7168_wide_launcher,
         get_island_norm3584_wide_launcher,
@@ -216,6 +226,65 @@ def _norm_rows(
 ) -> None:
     layout = _OWNERS[handle].layout
     owner = layout.owner
+    if getattr(layout, "is_tp8_ro", False):
+        if get_tp8_ro_norm3584_launcher is None:
+            raise RuntimeError("TP8 fused 3584-column norm reduction requires b12x TP8 RO launcher")
+        if (
+            layout.width == 3584
+            and 1 <= layout.rows <= 32
+            and out.shape == (layout.rows, 448)
+            and source.is_contiguous()
+            and full.is_contiguous()
+            and out.is_contiguous()
+            and weight.is_contiguous()
+            and source.data_ptr() % 16 == 0
+            and full.data_ptr() % 16 == 0
+            and out.data_ptr() % 16 == 0
+            and weight.data_ptr() % 16 == 0
+            and begin.dtype == torch.int32
+        ):
+            dev_sel, bias, eager_slot, peer_tbl, sig_tbl = layout.resolve_slot()
+            dev_idx = owner.device.index or 0
+            launcher = get_tp8_ro_norm3584_launcher(
+                owner.rank,
+                layout.rows,
+                layout.ar_blocks,
+                layout.ar_threads,
+                layout.transport,
+                dev_sel,
+                bias,
+                dev_idx,
+            )
+            if not dev_sel:
+                for graph_bias in (0, 1):
+                    get_tp8_ro_norm3584_launcher(
+                        owner.rank,
+                        layout.rows,
+                        layout.ar_blocks,
+                        layout.ar_threads,
+                        layout.transport,
+                        True,
+                        graph_bias,
+                        dev_idx,
+                    )
+            launcher(
+                peer_tbl,
+                sig_tbl,
+                source.data_ptr(),
+                full.data_ptr(),
+                weight.data_ptr(),
+                out.data_ptr(),
+                begin.data_ptr(),
+                layout.plain_region_packs,
+                layout.plain_capacity_packs,
+                float(eps),
+                eager_slot,
+            )
+            return
+        raise ValueError(
+            f"TP8 fused 3584-column norm reduction does not support layout width={layout.width}, "
+            f"rows={layout.rows}, out.shape={tuple(out.shape)}"
+        )
     if (
         layout.width == 3584
         and 1 <= layout.rows <= (64 if get_island_norm3584_wide_launcher is not None else 32)
@@ -302,6 +371,101 @@ def _mix_rows(
     ):
         raise ValueError("PCIe row reduction addend must match 16-byte aligned contiguous BF16 source rows")
     owner = layout.owner
+    if getattr(layout, "is_tp8_ro", False):
+        if get_tp8_ro_mix7168_launcher is None:
+            raise RuntimeError("TP8 fused 7168-column mix reduction requires b12x TP8 RO launcher")
+        if (
+            layout.width == 7168
+            and 1 <= layout.rows <= 32
+            and spec.mode in (ADD, REPLACE)
+            and 0 <= spec.sources <= 8
+            and source.is_contiguous()
+            and source.data_ptr() % 16 == 0
+            and full.is_contiguous()
+            and full.data_ptr() % 16 == 0
+            and add_tensor.is_contiguous()
+            and add_tensor.data_ptr() % 16 == 0
+            and prefix.stride(1) == 1
+            and prefix.stride(0) % 8 == 0
+            and prefix.data_ptr() % 16 == 0
+            and blocks.stride(2) == 1
+            and blocks.stride(1) % 8 == 0
+            and blocks.stride(0) % 8 == 0
+            and blocks.data_ptr() % 16 == 0
+            and score.is_contiguous()
+            and score.dtype == torch.float32
+            and score.data_ptr() % 16 == 0
+            and norm.is_contiguous()
+            and norm.data_ptr() % 16 == 0
+            and out.stride(1) == 1
+            and out.stride(0) % 8 == 0
+            and out.data_ptr() % 16 == 0
+            and tap.stride(1) == 1
+            and tap.stride(0) % 8 == 0
+            and tap.data_ptr() % 16 == 0
+        ):
+            dev_sel, bias, eager_slot, peer_tbl, sig_tbl = layout.resolve_slot()
+            dev_idx = owner.device.index or 0
+            launcher = get_tp8_ro_mix7168_launcher(
+                owner.rank,
+                layout.rows,
+                layout.ar_blocks,
+                layout.ar_threads,
+                layout.transport,
+                dev_sel,
+                bias,
+                spec.sources,
+                spec.write,
+                spec.mode,
+                mixture is not None,
+                has_addend,
+                dev_idx,
+            )
+            if not dev_sel:
+                for graph_bias in (0, 1):
+                    get_tp8_ro_mix7168_launcher(
+                        owner.rank,
+                        layout.rows,
+                        layout.ar_blocks,
+                        layout.ar_threads,
+                        layout.transport,
+                        True,
+                        graph_bias,
+                        spec.sources,
+                        spec.write,
+                        spec.mode,
+                        mixture is not None,
+                        has_addend,
+                        dev_idx,
+                    )
+            launcher(
+                peer_tbl,
+                sig_tbl,
+                source.data_ptr(),
+                add_tensor.data_ptr(),
+                full.data_ptr(),
+                prefix.data_ptr(),
+                blocks.data_ptr(),
+                score.data_ptr(),
+                norm.data_ptr(),
+                out.data_ptr(),
+                tap.data_ptr(),
+                layout.plain_region_packs,
+                layout.plain_capacity_packs,
+                prefix.stride(0),
+                blocks.stride(0),
+                blocks.stride(1),
+                out.stride(0),
+                tap.stride(0),
+                float(eps),
+                float(output_eps),
+                eager_slot,
+            )
+            return
+        raise ValueError(
+            f"TP8 fused 7168-column mix reduction does not support layout width={layout.width}, "
+            f"rows={layout.rows}, mode={spec.mode}, sources={spec.sources}"
+        )
     ab = 2 if layout.rows <= 3 else (4 if layout.rows <= 20 else 8)
     if (
         layout.width == 7168
@@ -434,6 +598,74 @@ def _residual_norm_rows(
 ) -> None:
     layout = _OWNERS[handle].layout
     owner = layout.owner
+    if getattr(layout, "is_tp8_ro", False):
+        if get_tp8_ro_resnorm7168_launcher is None:
+            raise RuntimeError("TP8 fused 7168-column residual norm reduction requires b12x TP8 RO launcher")
+        if (
+            layout.width == 7168
+            and 1 <= layout.rows <= 32
+            and source.is_contiguous()
+            and full.is_contiguous()
+            and weight.is_contiguous()
+            and residual.stride(1) == 1
+            and residual_out.stride(1) == 1
+            and norm_out.stride(1) == 1
+            and residual.stride(0) % 8 == 0
+            and residual_out.stride(0) % 8 == 0
+            and norm_out.stride(0) % 8 == 0
+            and source.data_ptr() % 16 == 0
+            and full.data_ptr() % 16 == 0
+            and residual.data_ptr() % 16 == 0
+            and weight.data_ptr() % 16 == 0
+            and residual_out.data_ptr() % 16 == 0
+            and norm_out.data_ptr() % 16 == 0
+        ):
+            dev_sel, bias, eager_slot, peer_tbl, sig_tbl = layout.resolve_slot()
+            dev_idx = owner.device.index or 0
+            launcher = get_tp8_ro_resnorm7168_launcher(
+                owner.rank,
+                layout.rows,
+                layout.ar_blocks,
+                layout.ar_threads,
+                layout.transport,
+                dev_sel,
+                bias,
+                dev_idx,
+            )
+            if not dev_sel:
+                for graph_bias in (0, 1):
+                    get_tp8_ro_resnorm7168_launcher(
+                        owner.rank,
+                        layout.rows,
+                        layout.ar_blocks,
+                        layout.ar_threads,
+                        layout.transport,
+                        True,
+                        graph_bias,
+                        dev_idx,
+                    )
+            launcher(
+                peer_tbl,
+                sig_tbl,
+                source.data_ptr(),
+                full.data_ptr(),
+                residual.data_ptr(),
+                weight.data_ptr(),
+                residual_out.data_ptr(),
+                norm_out.data_ptr(),
+                layout.plain_region_packs,
+                layout.plain_capacity_packs,
+                residual.stride(0),
+                residual_out.stride(0),
+                norm_out.stride(0),
+                float(eps),
+                eager_slot,
+            )
+            return
+        raise ValueError(
+            f"TP8 fused 7168-column residual norm reduction does not support layout width={layout.width}, "
+            f"rows={layout.rows}"
+        )
     if (
         layout.width == 7168
         and 1 <= layout.rows <= (64 if get_island_resnorm7168_wide_launcher is not None else 32)
@@ -605,10 +837,12 @@ class _ReductionFixture:
         rows = spec.rows
         self.source = torch.empty((rows, spec.width), dtype=torch.bfloat16, device=device)
         self.full = torch.empty_like(self.source)
-        columns = 224 if spec.width == 3584 else spec.width
+        world = getattr(owner, "world_size", 16)
+        cols_3584 = 3584 // world
+        columns = cols_3584 if spec.width == 3584 else spec.width
         self.out = torch.empty((rows, columns), dtype=torch.bfloat16, device=device)
         self.norm = torch.empty(columns, dtype=torch.bfloat16, device=device)
-        self.begin = torch.tensor([owner.rank * 224], dtype=torch.int32, device=device)
+        self.begin = torch.tensor([owner.rank * cols_3584], dtype=torch.int32, device=device)
         self.addend = torch.empty_like(self.source) if spec.addend else None
         self.state = [self.source, self.norm]
         if self.addend is not None:
@@ -632,7 +866,7 @@ class _ReductionFixture:
         self.patterns = []
         for index in range(4):
             generator = torch.Generator().manual_seed(307 + index)
-            partials = torch.randn((16, rows, spec.width), generator=generator).to(torch.bfloat16)
+            partials = torch.randn((world, rows, spec.width), generator=generator).to(torch.bfloat16)
             if index == 1:
                 partials[:, :, ::3] = torch.tensor(-0.0, dtype=torch.bfloat16)
             if index == 2:
@@ -642,7 +876,7 @@ class _ReductionFixture:
             pattern = [partials[owner.rank].to(device)]
             for value in self.state[1:]:
                 if value is self.addend:
-                    add_partials = torch.randn((16, rows, spec.width), generator=generator).to(torch.bfloat16)
+                    add_partials = torch.randn((world, rows, spec.width), generator=generator).to(torch.bfloat16)
                     pattern.append(add_partials[owner.rank].to(device))
                 else:
                     pattern.append(
@@ -866,6 +1100,11 @@ class RowReductionTuning:
                     device=self.device,
                     stream=torch.cuda.Stream(device=self.device),
                     pool=torch.cuda.graph_pool_handle(),
+                    collective=(
+                        representative.layout.owner
+                        if getattr(representative.layout, "is_tp8_ro", False)
+                        else None
+                    ),
                     coordinator=self.coordinator,
                     report_catalog=False,
                     cache_root=self.cache_root,
@@ -903,9 +1142,13 @@ class RowReductionTuning:
                     else f"kimi-row-normalization-{geometry.width}"
                 )
                 direct_fo_tag = (
-                    "sw4_grid_v9b"
-                    if (geometry.residual_norm or geometry.width == 3584)
-                    else "sw4_grid_v14_mix"
+                    "tp8_ro_fused_v3"
+                    if getattr(representative.layout, "is_tp8_ro", False)
+                    else (
+                        "sw4_grid_v9b"
+                        if (geometry.residual_norm or geometry.width == 3584)
+                        else "sw4_grid_v14_mix"
+                    )
                 )
                 with session._tuning_clocks():
                     result = race_compositions(

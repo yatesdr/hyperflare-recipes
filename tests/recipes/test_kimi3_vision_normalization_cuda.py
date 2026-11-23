@@ -10,7 +10,6 @@ from hyperflare_recipes.recipes.kimi3.vision import VisionScratch, _RMSNorm
 
 
 def test_prepared_operator_examples_are_disjoint(monkeypatch):
-    from types import SimpleNamespace
     from hyperflare_recipes.recipes.kimi3 import vision
 
     operands = []
@@ -28,6 +27,7 @@ def test_prepared_operator_examples_are_disjoint(monkeypatch):
             operands.append((kwargs["name"], (query, key, value, output)))
 
     monkeypatch.setattr(vision, "UnquantizedProjection", Projection)
+    monkeypatch.setattr(vision, "prepare_projection", Projection)
     monkeypatch.setattr(vision, "PreparedTorchRMSNorm", Projection)
     monkeypatch.setattr(vision, "PreparedVarlenAttention", Attention)
     monkeypatch.setattr(vision, "prepare_cached_rotary", lambda session: None)
@@ -37,7 +37,7 @@ def test_prepared_operator_examples_are_disjoint(monkeypatch):
     for layer in range(27):
         names.extend(f"vision_tower.encoder.blocks.{layer}.{name}" for name in (
             "norm0.weight", "norm1.weight", "wqkv.weight", "wo.weight", "mlp.fc0.weight", "mlp.fc1.weight"))
-    weights = SimpleNamespace(tensors={name: torch.empty((1, 1024), device="meta") for name in names})
+    weights = vision.VisionWeights(tensors={name: torch.empty((1, 1024), device="meta") for name in names})
     examples = {}
     for capacity in (256, 128):
         scratch = VisionScratch.allocate(capacity, "cpu", examples=examples)

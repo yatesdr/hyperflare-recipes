@@ -113,7 +113,7 @@ _E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
 @torch.no_grad()
-def nvfp4_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 8192):
+def nvfp4_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 1024):
     """Quantize a BF16 [vocab, hidden] head or vocabulary shard to NVFP4 for draft proposals.
 
     E4M3 scales cover 16 values and one amax-derived FP32 gain covers the shard. A

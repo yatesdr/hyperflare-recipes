@@ -12,7 +12,7 @@ from b12x.sequence import gdn_decode, kda_prefill, short_conv
 from hyperflare_recipes.components.gated_norm import PreparedGatedRMSNorm
 from hyperflare_recipes.components.recurrent import prepare_sequence_binding
 from hyperflare_recipes.components.kda_speculation import _record, _record_fused, register_recording
-from ignition.preparation.examples import declaration_tensor
+from .examples import declaration_tensor
 from ignition.preparation.tuning import register_finalizer
 from hyperflare_recipes.components.recurrent import run_short_conv
 from b12x.sequence.gdn_decode._kernels import _gdn_decode_op as kda_decode_out

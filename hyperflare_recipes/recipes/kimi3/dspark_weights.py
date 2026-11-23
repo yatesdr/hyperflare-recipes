@@ -98,6 +98,12 @@ class DraftWeights:
                                                    for name in ("gate_proj", "up_proj")])),
                                  stored(matrix(prefix + ".mlp.down_proj", columns=intermediate, temporary=online_mxfp8)))
                 layers.append(DraftLayerWeights(qkv, output, query_norm, key_norm, input_norm, post_norm, mlp))
+            context_kv = concat_qkv(context)
+            context.clear()
+            if convert_qkv:
+                context_kv = mxfp8_rows(context_kv)
+            if torch.device(device).type == "cuda":
+                torch.cuda.empty_cache()
             hidden_rows = shard.partition(hidden, alignment=64)
             if target_embedding is None or "embed_tokens.weight" in manifest.tensors:
                 embedding = matrix("embed_tokens", columns=hidden_rows)
@@ -117,16 +123,16 @@ class DraftWeights:
             else:
                 from hyperflare_recipes.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
                 head = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}[draft_head_quantization](head)
-            markov_embedding = matrix("markov_head.markov_w1")
+            if torch.device(device).type == "cuda":
+                torch.cuda.empty_cache()
             replicate = markov_head_quantization == "fp8"
+            markov_embedding = matrix("markov_head.markov_w1", temporary=replicate)
             markov_head = matrix("markov_head.markov_w2", rows=None if replicate else vocabulary, temporary=replicate)
             if markov_embedding.shape[1] != d.markov_rank or markov_head.shape[1] != d.markov_rank:
                 raise ValueError("DSpark Markov projections disagree with markov_rank")
             if replicate:
                 from hyperflare_recipes.components.markov_sampling import fp8_markov_head
+                markov_embedding = fp8_markov_head(markov_embedding)
                 markov_head = fp8_markov_head(markov_head)
-        context_kv = concat_qkv(context)
-        if convert_qkv:
-            context_kv = mxfp8_rows(context_kv)
         return cls(projection, hidden_norm, context_kv, norm, embedding, head, markov_embedding,
                    markov_head, tuple(layers))

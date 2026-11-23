@@ -13,6 +13,7 @@ import torch
 
 from hyperflare_recipes.components.weights import (DirectWeightLoader, SharedColumnReads, fp4_down_staging_bytes,
                                          quantize_bf16_linear_as_mxfp8)
+from ignition.preparation.host_memory import release_unused
 from ignition.preparation.persistent import allocated_tensor_bytes, persistent_cat, persistent_empty
 
 from .config import DSparkConfig, ModelConfig
@@ -31,7 +32,7 @@ class ModelWeights:
     head: torch.Tensor
     output_res_score: torch.Tensor
     layers: tuple[dict, ...]
-    scale_scratch: tuple[torch.Tensor, ...]
+    scale_scratch: tuple[torch.Tensor, ...] | None
     allocated_bytes: int
     vision: object = None
     draft: object = None
@@ -58,9 +59,21 @@ class ModelWeights:
             layers = []
             for index in range(len(config.layers)):
                 layers.append(loader.load_layer(index))
+        release_unused()
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
         if vision:
             from .vision import VisionWeights
-            vision = VisionWeights.load(manifest, device, progress=progress)
+            is_exl3 = config.text.get("quantization_config", {}).get("quant_method") == "exl3"
+            vision_mxfp8 = online_mxfp8 and online_mxfp8_scope in ("all", "kda-all")
+            vision = VisionWeights.load(
+                manifest, device, shard=shard,
+                tp_enabled=(is_exl3 and shard.world_size == 8),
+                online_mxfp8=vision_mxfp8, progress=progress,
+            )
+            release_unused()
+            if torch.device(device).type == "cuda":
+                torch.cuda.empty_cache()
         else:
             vision = None
         draft = None
@@ -75,6 +88,7 @@ class ModelWeights:
                 from hyperflare_recipes.recipes.kimi31.dspark_config import window_draft
                 from .dspark_weights import DraftWeights
 
+                draft_online_mxfp8 = draft_online_mxfp8 or draft_body_quantization == "mxfp8"
                 draft_spec = window_draft(raw_draft, config.text)
                 draft_args = dict(target_embedding=embedding, draft_head_quantization=draft_head_quantization,
                                   markov_head_quantization=markov_head_quantization)
@@ -107,8 +121,8 @@ class ModelWeights:
 class KimiWeightLoader(DirectWeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, online_mxfp8=False,
                  online_mxfp8_scope="all", peers=None):
-        if online_mxfp8_scope not in ("all", "kda-input"):
-            raise ValueError("online MXFP8 scope must be all or kda-input")
+        if online_mxfp8_scope not in ("all", "kda-input", "kda-all"):
+            raise ValueError("online MXFP8 scope must be all, kda-input, or kda-all")
         super().__init__(manifest, device, prefixes=prefixes, progress=progress)
         self.peers, self.shared_columns = peers, None
         self.config, self.shard = ModelConfig.load(manifest.snapshot), shard
@@ -117,6 +131,11 @@ class KimiWeightLoader(DirectWeightLoader):
         self.online_mxfp8_scope = online_mxfp8_scope
         self.config.validate_shard(shard)
         self.scale_scratch = None
+        if self.config.text.get("quantization_config", {}).get("quant_method") == "exl3":
+            expected = tuple(range(self.config.text["first_k_dense_replace"],
+                                   self.config.text["num_hidden_layers"]))
+            if self.exl3_manifest.geometry.moe_layer_indices != expected:
+                raise ValueError("EXL3 manifest must cover every routed-expert layer")
 
     def _selected_names(self):
         return {n for n in super()._selected_names() if n.startswith("language_model.")}
@@ -138,8 +157,12 @@ class KimiWeightLoader(DirectWeightLoader):
         if self.shared_columns is None:
             group, peer_storage = self.peers
             c = self.config.text
-            capacity = -(-c["num_experts"] // self.shard.world_size) * fp4_down_staging_bytes(
-                c["routed_expert_hidden_size"], c["moe_intermediate_size"], 32)
+            if c.get("quantization_config", {}).get("quant_method") == "exl3":
+                # EXL3 loads experts directly from its manifest; shared staging only serves dense column-sharded BF16 projections.
+                capacity = 32 << 20
+            else:
+                capacity = -(-c["num_experts"] // self.shard.world_size) * fp4_down_staging_bytes(
+                    c["routed_expert_hidden_size"], c["moe_intermediate_size"], 32)
             self.shared_columns = SharedColumnReads(group, peer_storage, self.device, capacity)
         return self.shared_columns
 
@@ -183,8 +206,12 @@ class KimiWeightLoader(DirectWeightLoader):
         head_rows = h0 * 128, h1 * 128
         converted = set()
         if self.online_mxfp8:
-            converted = ({"input", "forget", "latent_gate", "q_b", "output"}
-                         if self.online_mxfp8_scope == "all" else {"input"})
+            if self.online_mxfp8_scope == "all":
+                converted = {"input", "forget", "latent_gate", "q_b", "output"}
+            elif self.online_mxfp8_scope == "kda-all":
+                converted = {"input", "output"} if self.config.layers[index] == "kda" else set()
+            else:
+                converted = {"input"} if self.config.layers[index] == "kda" else set()
         attention = {}
         if self.config.layers[index] == "kda":
             # Every projection of the layer input in one GEMM: query, key, value, forget-gate input, output gate and
@@ -262,21 +289,32 @@ class KimiWeightLoader(DirectWeightLoader):
         result["router"] = self.linear(m + ".gate", rows=shard.partition(c["num_experts"], alignment=8))
         result["correction"] = self.load_tensor(m + ".gate.e_score_correction_bias")
         convert_latent = self.online_mxfp8 and self.online_mxfp8_scope == "all"
-        result["latent_down"] = self.linear(m + ".routed_expert_down_proj",
-            columns=shard.partition(c["hidden_size"]), temporary=convert_latent)
-        # Decode rows project their own latent rows and gather them with the router shards.
+        # Multi-rank graphs always gather row-sharded latent projections via route_runtime / prefill_route_runtime;
+        # column-sharded latent_down is only read when world_size == 1 (prefill_route_runtime is None).
+        if shard.world_size == 1:
+            result["latent_down"] = self.linear(m + ".routed_expert_down_proj",
+                columns=shard.partition(c["hidden_size"]), temporary=convert_latent)
+        # Decode and multi-rank prefill rows project their own latent rows and gather them with the router shards.
         result["latent_down_rows"] = self.linear(m + ".routed_expert_down_proj",
                                                  rows=shard.partition(c["routed_expert_hidden_size"]), temporary=convert_latent)
         result["latent_up"] = self.linear(m + ".routed_expert_up_proj",
             columns=shard.partition(c["routed_expert_hidden_size"]), temporary=convert_latent)
         if self.online_mxfp8 and self.online_mxfp8_scope == "all":
             for key in ("latent_down", "latent_down_rows", "latent_up"):
-                result[key] = quantize_bf16_linear_as_mxfp8(result[key])
+                if key in result:
+                    result[key] = quantize_bf16_linear_as_mxfp8(result[key])
         # Each rank applies the latent norm's weights to the columns its up-projection shard reads.
         result["latent_norm"] = self.load_tensor(m + ".routed_expert_norm.weight",
                                                  extent=slice(*shard.partition(c["routed_expert_hidden_size"])))
         prefixes = [f"{m}.experts.{i}" for i in range(c["num_experts"])]
         formats = {self.config.projection_format(f"{p}.{projection}") for p in prefixes for projection in ("w1", "w2", "w3")}
+        if formats == {"exl3"}:
+            result["experts"], result["expert_trellis"] = self.load_exl3_experts(index,
+                num_experts=c["num_experts"], hidden_size=c["routed_expert_hidden_size"],
+                intermediate_size=c["moe_intermediate_size"],
+                intermediate_range=shard.partition(c["moe_intermediate_size"], alignment=128),
+                activation="situ")
+            return result
         if len(formats) != 1 or not formats <= {"mxfp4", "mxfp4_csf"}:
             raise ValueError(f"{m}: expert storage disagrees with quantization configuration")
         hidden, intermediate = c["routed_expert_hidden_size"], c["moe_intermediate_size"] // shard.world_size

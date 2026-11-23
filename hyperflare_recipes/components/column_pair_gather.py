@@ -87,11 +87,13 @@ class PreparedColumnPairGather:
         self.concurrent = None
 
     def enable_concurrent(self, *, workspace, session, parallel_plans, send_buffer=None):
-        if len(self.parts) != 1:
-            raise ValueError("concurrent paired gather requires a single chunk")
-        self.concurrent = ConcurrentAllGather(
-            self.parts[0], workspace=workspace, session=session,
-            parallel_plans=parallel_plans, send_buffer=send_buffer)
+        self.concurrent = tuple(
+            ConcurrentAllGather(
+                part, workspace=workspace, session=session,
+                parallel_plans=parallel_plans, send_buffer=send_buffer)
+            for part in self.parts
+        )
+        self.stream_handle = workspace.auxiliary_stream.cuda_stream
         return self
 
     def functional(self, *, session):
@@ -100,7 +102,8 @@ class PreparedColumnPairGather:
         for part in self.parts:
             part.functional(session=session)
         if self.concurrent is not None:
-            self.concurrent.functional(session=session)
+            for conc in self.concurrent:
+                conc.functional(session=session)
         self.first = self.second = self.output_first = self.output_second = self.send = self.received = None
         return self
 
@@ -110,10 +113,30 @@ class PreparedColumnPairGather:
         send = torch.empty((self.rows, self.columns), dtype=torch.bfloat16, device=first.device)
         send[:, :self.first_width].copy_(first)
         send[:, self.first_width:].copy_(second.view(torch.bfloat16))
-        return self.concurrent.start(send, dependencies=dependencies)
+        if len(self.concurrent) == 1:
+            return self.concurrent[0].start(send, dependencies=dependencies)
+        from ignition.components.collectives import PendingAllGather, _start_all_gather
+        received = torch.empty((self.rows, self.world * self.columns), dtype=torch.bfloat16, device=first.device)
+        prev = None
+        for idx in range(len(self.concurrent)):
+            begin, end = self.bounds[idx]
+            conc = self.concurrent[idx]
+            chunk_deps = [*conc.gather.dependencies, *dependencies]
+            if prev is not None:
+                chunk_deps.append(prev)
+            _start_all_gather(send[begin:end], received[begin:end], chunk_deps, conc.gather.handle, conc.stream_handle)
+            prev = received[begin:end]
+        join_deps = [*dependencies, prev] if prev is not None else list(dependencies)
+        return PendingAllGather(send, received, join_deps)
 
     def finish(self, pending, dependency):
-        received = self.concurrent.finish(pending, dependency).view(self.rows, self.world, self.columns)
+        if len(self.concurrent) == 1:
+            received = self.concurrent[0].finish(pending, dependency)
+        else:
+            from ignition.components.collectives import _join_all_gather
+            _join_all_gather(pending.source, pending.output, pending.dependencies, dependency, self.stream_handle)
+            received = pending.output
+        received = received.view(self.rows, self.world, self.columns)
         output_first = torch.empty((self.rows, self.world * self.first_width), dtype=torch.bfloat16, device=received.device)
         output_second = torch.empty((self.rows, self.world * self.second_width), dtype=torch.float32, device=received.device)
         output_first.view(self.rows, self.world, self.first_width).copy_(received[:, :, :self.first_width])

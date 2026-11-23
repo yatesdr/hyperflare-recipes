@@ -11,14 +11,17 @@ import torch
 from torch import nn
 from transformers.models.kimi_k25.modeling_kimi_k25 import Kimi_K25VisionEncoderLayer
 
+from ignition.components.collectives import PreparedChunkedAllReduce
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.rms_norm import PreparedTorchRMSNorm
 from hyperflare_recipes.components.rotary import apply_cached_rotary, prepare_cached_rotary
 from hyperflare_recipes.components.varlen_attention import PreparedVarlenAttention
-from hyperflare_recipes.components.weights import DirectWeightLoader
-from ignition.preparation.examples import declaration_tensor
-from ignition.preparation.persistent import persistent_copy
+from hyperflare_recipes.components.weights import DirectWeightLoader, quantize_bf16_linear_as_mxfp8
+from .examples import declaration_tensor
+from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.preparation.rebuild_manifest import weight_container
+
+from .projections import prepare_projection
 
 PATCH_CAPACITIES = (256, 1024, 4096, 16384, 65536)
 FEATURES = 16384
@@ -28,14 +31,60 @@ HIDDEN = 7168
 @weight_container(('tensors',))
 @dataclass(frozen=True)
 class VisionWeights:
-    tensors: dict[str, torch.Tensor]
+    tensors: dict[str, object]
+    tp_size: int = 1
+    local_heads: int = 12
 
     @classmethod
-    def load(cls, manifest, device, progress=None):
+    def load(cls, manifest, device, *, shard=None, tp_enabled=False, online_mxfp8=False, progress=None):
+        tp_enabled = bool(tp_enabled and shard is not None and shard.world_size in (8, 16))
+        tp_size = shard.world_size if tp_enabled else 1
+        local_heads = 16 // tp_size if tp_enabled else 12
+        h0 = shard.rank * local_heads if tp_enabled else 0
+        h1 = h0 + local_heads
+        mlp_range = shard.partition(4096, alignment=32) if tp_enabled else (0, 4096)
+
+        def finalize_linear(weight):
+            if online_mxfp8:
+                return quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False)
+            return persistent_copy(weight)
+
+        tensors = {}
         with DirectWeightLoader(manifest, device, prefixes=('vision_tower.', 'mm_projector.'), progress=progress) as loader:
             names = sorted(loader._selected_names())
-            tensors = dict(zip(names, loader.load_tensors(names), strict=True))
-        return cls(tensors)
+            if not tp_enabled and not online_mxfp8:
+                tensors = dict(zip(names, loader.load_tensors(names), strict=True))
+                return cls(tensors, tp_size=1, local_heads=12)
+            for name in names:
+                if name.endswith('.wqkv.weight'):
+                    if not tp_enabled:
+                        w = loader.load_tensor(name, temporary=True)
+                    elif h0 < 12:
+                        w = loader.load_tensor(name, temporary=True).view(3, 12, 128, 1024)[:, h0:h1, :, :].reshape(
+                            3 * local_heads * 128, 1024
+                        ).contiguous()
+                    else:
+                        w = torch.zeros((3 * local_heads * 128, 1024), dtype=torch.bfloat16, device=device)
+                    tensors[name] = finalize_linear(w)
+                elif name.endswith('.wo.weight'):
+                    if not tp_enabled:
+                        w = loader.load_tensor(name, temporary=True)
+                    elif h0 < 12:
+                        w = loader.load_tensor(name, temporary=True).view(1024, 12, 128)[:, h0:h1, :].reshape(
+                            1024, local_heads * 128
+                        ).contiguous()
+                    else:
+                        w = torch.zeros((1024, local_heads * 128), dtype=torch.bfloat16, device=device)
+                    tensors[name] = finalize_linear(w)
+                elif name.endswith('.mlp.fc0.weight') or name == 'mm_projector.proj.0.weight':
+                    w = loader.load_tensor(name, extent=(slice(*mlp_range), slice(None)), temporary=True)
+                    tensors[name] = finalize_linear(w)
+                elif name.endswith('.mlp.fc1.weight') or name == 'mm_projector.proj.2.weight':
+                    w = loader.load_tensor(name, extent=(slice(None), slice(*mlp_range)), temporary=True)
+                    tensors[name] = finalize_linear(w)
+                else:
+                    tensors[name] = loader.load_tensor(name)
+        return cls(tensors, tp_size=tp_size, local_heads=local_heads)
 
 
 @dataclass(frozen=True)
@@ -53,10 +102,10 @@ class VisionInputs:
     vision_feature_offset: torch.Tensor
 
     @classmethod
-    def allocate(cls, device):
+    def allocate(cls, device, *, max_patches=PATCH_CAPACITIES[-1]):
         def zeros(shape, dtype=torch.int32):
             return torch.zeros(shape, dtype=dtype, device=device)
-        n = PATCH_CAPACITIES[-1]
+        n = max_patches
         return cls(zeros((n, 588), torch.float32), zeros((n, 2), torch.int64),
             zeros((n, 4), torch.int64), zeros((n, 4), torch.float32), zeros((n // 4, 4)),
             zeros(2), zeros(1), zeros(1), zeros(1) - 1, zeros(1, torch.int64), zeros(1))
@@ -84,13 +133,15 @@ class VisionScratch:
     post_normalized: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, device, *, examples=None):
+    def allocate(cls, patches, device, *, examples=None, tp_size=1, local_heads=12):
         examples = {} if examples is None else examples
+        mlp_width = 4096 // tp_size
+        attn_width = local_heads * 128
         shapes = dict(zip(cls.__dataclass_fields__, (
-            (patches, 588), (patches, 1024), (patches, 4608),
-            *((patches, 12, 128),) * 3, (patches, 1536), (patches, 1024),
-            (patches, 4096), (patches, 1024), (patches // 4, 4096),
-            (patches // 4, 4096), (patches // 4, HIDDEN), (patches, 1024),
+            (patches, 588), (patches, 1024), (patches, 3 * attn_width),
+            *((patches, local_heads, 128),) * 3, (patches, attn_width), (patches, 1024),
+            (patches, mlp_width), (patches, 1024), (patches // 4, 4096),
+            (patches // 4, mlp_width), (patches // 4, HIDDEN), (patches, 1024),
             (patches // 4, HIDDEN)), strict=True))
         # Each prepared kernel has disjoint operands; serving forwards allocate their own tensors.
         roles = dict.fromkeys(("patches", "qkv", "projected", "mlp_up",
@@ -100,7 +151,8 @@ class VisionScratch:
                                             torch.bfloat16, device)
                    for name in sorted(roles, key=lambda name: prod(shapes[name]), reverse=True)}
         # Attention reads disjoint Q/K/V heads within each packed projection row.
-        tensors.update(zip(("query", "key", "value"), tensors["qkv"].view(patches, 3, 12, 128).unbind(1), strict=True))
+        tensors.update(zip(("query", "key", "value"),
+                           tensors["qkv"].view(patches, 3, local_heads, 128).unbind(1), strict=True))
         return cls(*(tensors[name] for name in cls.__dataclass_fields__))
 
     def rows(self, patches):
@@ -109,12 +161,24 @@ class VisionScratch:
 
 
 class _Projection(nn.Module):
-    def __init__(self, weight, source, output, *, session, name):
+    def __init__(self, weight, source, output, *, session, workspace, name,
+                 reduce_output=None, runtime=None, coordinator=None):
         super().__init__()
-        self.operation = UnquantizedProjection(source, weight, output, session=session, name=name).functional(session=session)
+        self.operation = prepare_projection(
+            source, weight, output, session=session, name=name, workspace=workspace
+        ).functional(session=session)
+        self.reduce = (
+            None
+            if runtime is None
+            else PreparedChunkedAllReduce(
+                output, reduce_output, runtime=runtime, coordinator=coordinator,
+                session=session, name=name + '.reduce',
+            ).functional(session=session)
+        )
 
     def forward(self, source):
-        return self.operation(source)
+        result = self.operation(source)
+        return result if self.reduce is None else self.reduce(result)
 
 
 class _InplaceGELU(nn.Module):
@@ -150,27 +214,35 @@ def _fake_rotary_qkv(qkv, cache, positions):
 
 
 class _Attention(nn.Module):
-    def __init__(self, weights, scratch, cu, positions, *, session, workspace, name):
+    def __init__(self, weights, scratch, cu, positions, *, local_heads, session, workspace, name,
+                 runtime=None, coordinator=None):
         super().__init__()
         s = scratch
+        self.local_heads = local_heads
         self.positions = positions
-        self.qkv = _Projection(weights['wqkv.weight'], s.hidden, s.qkv, session=session, name=name + '.qkv')
-        self.output = _Projection(weights['wo.weight'], s.attended, s.projected, session=session, name=name + '.output')
+        self.qkv = _Projection(weights['wqkv.weight'], s.hidden, s.qkv,
+                               session=session, workspace=workspace, name=name + '.qkv')
+        self.output = _Projection(weights['wo.weight'], s.attended, s.projected,
+                                  session=session, workspace=workspace, name=name + '.output',
+                                  reduce_output=s.hidden, runtime=runtime, coordinator=coordinator)
         self.attend = PreparedVarlenAttention(s.query, s.key, s.value, cu, s.attended.view_as(s.query),
             session=session, workspace=workspace, name=name + '.attention').functional(session=session)
 
     def forward(self, source, *, cu_seqlens, position_embeddings):
-        qkv = self.qkv(source).view(-1, 3, 12, 128)
+        qkv = self.qkv(source).view(-1, 3, self.local_heads, 128)
         _apply_rotary_qkv(qkv, position_embeddings, self.positions)
         query, key, value = qkv.unbind(1)
         attended = self.attend(query, key, value, cu_seqlens)
-        return self.output(attended.view(-1, 1536))
+        return self.output(attended.view(-1, self.local_heads * 128))
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, session, workspace, name):
+    def __init__(self, weights, scratch, inputs, *, session, workspace, name,
+                 runtime=None, coordinator=None):
         self.inputs = inputs
         s, tensors = scratch, weights.tensors
+        tp_runtime = runtime if weights.tp_size > 1 else None
+        local_heads = weights.local_heads
         n, device = s.patches.shape[0], s.patches.device
         self.capacity = n
         cu = torch.zeros((2,), dtype=torch.int32, device=device)
@@ -183,7 +255,8 @@ class PreparedVision:
         self.patch = UnquantizedProjection(s.patches, tensors['vision_tower.patch_embed.proj.weight'].flatten(1),
             s.hidden, session=session, name=name + '.patch').functional(session=session)
         self.blocks = []
-        config = SimpleNamespace(hidden_size=1024, num_attention_heads=12, intermediate_size=4096, hidden_act='gelu_pytorch_tanh')
+        config = SimpleNamespace(hidden_size=1024, num_attention_heads=local_heads,
+                                 intermediate_size=4096 // weights.tp_size, hidden_act='gelu_pytorch_tanh')
         for layer in range(27):
             prefix = f'vision_tower.encoder.blocks.{layer}.'
             w = {key.removeprefix(prefix): value for key, value in tensors.items() if key.startswith(prefix)}
@@ -193,20 +266,25 @@ class PreparedVision:
                                   session=session, name=f'{name}.{layer}.norm1')
             block.norm2 = _RMSNorm(w['norm1.weight'], s.hidden, s.normalized,
                                   session=session, name=f'{name}.{layer}.norm2')
-            block.attn = _Attention(w, s, cu, rotary_positions,
-                session=session, workspace=workspace, name=f'{name}.{layer}')
-            block.mlp.fc1 = _Projection(w['mlp.fc0.weight'], s.hidden, s.mlp_up, session=session, name=f'{name}.{layer}.up')
+            block.attn = _Attention(w, s, cu, rotary_positions, local_heads=local_heads,
+                session=session, workspace=workspace, name=f'{name}.{layer}',
+                runtime=tp_runtime, coordinator=coordinator)
+            block.mlp.fc1 = _Projection(w['mlp.fc0.weight'], s.hidden, s.mlp_up,
+                                        session=session, workspace=workspace, name=f'{name}.{layer}.up')
             # The activation is the only consumer of the up projection's output.
             block.mlp.act = _InplaceGELU()
-            block.mlp.fc2 = _Projection(w['mlp.fc1.weight'], s.mlp_up, s.mlp_down, session=session, name=f'{name}.{layer}.down')
+            block.mlp.fc2 = _Projection(w['mlp.fc1.weight'], s.mlp_up, s.mlp_down,
+                                        session=session, workspace=workspace, name=f'{name}.{layer}.down',
+                                        reduce_output=s.projected, runtime=tp_runtime, coordinator=coordinator)
             block.eval()
             self.blocks.append(block)
         self.norm = _RMSNorm(tensors['vision_tower.encoder.final_layernorm.weight'], s.hidden, s.normalized,
                              session=session, name=name + '.norm')
         self.up = _Projection(tensors['mm_projector.proj.0.weight'], s.merged, s.activated,
-                             session=session, name=name + '.merge_up')
+                             session=session, workspace=workspace, name=name + '.merge_up')
         self.down = _Projection(tensors['mm_projector.proj.2.weight'], s.activated, s.output,
-                               session=session, name=name + '.merge_down')
+                               session=session, workspace=workspace, name=name + '.merge_down',
+                               reduce_output=s.post_normalized, runtime=tp_runtime, coordinator=coordinator)
         self.post_norm = _RMSNorm(tensors['mm_projector.post_norm.weight'], s.output, s.post_normalized, 1e-5,
                                   session=session, name=name + '.post_norm')
 

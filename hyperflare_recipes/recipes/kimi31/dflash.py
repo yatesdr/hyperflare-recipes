@@ -19,7 +19,7 @@ from hyperflare_recipes.components.kda_speculation import KDARecords
 from hyperflare_recipes.components.linear import BatchedUnquantizedProjection, prepare_projection
 from hyperflare_recipes.components.mlp import MLPScratch
 from hyperflare_recipes.components.speculation import SpeculativeRngState
-from ignition.preparation.examples import declaration_tensor
+from hyperflare_recipes.recipes.kimi3.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from hyperflare_recipes.recipes.kimi3.decoder import PreparedDecoder
 from hyperflare_recipes.recipes.kimi3.dcp import write_records

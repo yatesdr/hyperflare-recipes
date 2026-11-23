@@ -26,7 +26,7 @@ from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.speculation import SpeculativeRngState
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
-from ignition.preparation.examples import declaration_tensor
+from .examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 
 from .pointwise import rms_norm_columns
@@ -682,7 +682,11 @@ class PreparedMarkov:
 
     def __init__(self, weights, tokens, *, runtime, coordinator, session, name, examples=None):
         from hyperflare_recipes.components.embedding import PreparedEmbedding
-        from hyperflare_recipes.components.markov_sampling import PreparedRowScaledFP8MarkovProjection, RowScaledFP8MarkovWeight
+        from hyperflare_recipes.components.markov_sampling import (
+            PreparedRowScaledFP8MarkovEmbedding,
+            PreparedRowScaledFP8MarkovProjection,
+            RowScaledFP8MarkovWeight,
+        )
 
         rows, device = tokens.numel(), tokens.device
         draft, vocabulary = weights.draft, weights.config.vocabulary
@@ -691,8 +695,11 @@ class PreparedMarkov:
             (rows, weights.config.draft.markov_rank), torch.bfloat16, device)
         self.local = declaration_tensor(examples, "dspark.markov.local",
             (rows, columns), torch.float32, device)
-        self.embed = PreparedEmbedding(draft.markov_embedding, tokens, self.embedding, session=session,
-                                       name=name + ".embed").functional(session=session, dynamic_inputs=True)
+        embed_type = (PreparedRowScaledFP8MarkovEmbedding
+                      if isinstance(draft.markov_embedding, RowScaledFP8MarkovWeight)
+                      else PreparedEmbedding)
+        self.embed = embed_type(draft.markov_embedding, tokens, self.embedding, session=session,
+                                name=name + ".embed").functional(session=session, dynamic_inputs=True)
         projection_type = (PreparedRowScaledFP8MarkovProjection if isinstance(draft.markov_head, RowScaledFP8MarkovWeight)
                            else UnquantizedProjection)
         self.projection = projection_type(self.embedding, draft.markov_head, self.local,

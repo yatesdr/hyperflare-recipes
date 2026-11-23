@@ -6,7 +6,12 @@
 from types import MappingProxyType
 
 from ignition.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, Speculation, SpeculativeMethod
-from hyperflare_recipes.recipes.kimi3.recipe import RECIPE as KIMI3, prepare as prepare_kimi, usage
+from hyperflare_recipes.recipes.kimi3.recipe import (
+    RECIPE as KIMI3,
+    _inspect_exl3_replacement,
+    prepare as prepare_kimi,
+    usage,
+)
 from .dspark_config import DSPARK_REPOSITORY, DSPARK_REVISION, WINDOW_REPOSITORY, WINDOW_REVISION
 
 
@@ -14,8 +19,9 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             core_storage=None, ranks=None):
     if not plan.context_parallel:
         raise ValueError("Kimi K3.1 preparation requires context parallelism")
-    if (plan.context_parallel_size or plan.world_size) not in (4, 8, 16):
-        raise ValueError("Kimi K3.1 TP16 supports DCP4, DCP8 or DCP16")
+    if (plan.context_parallel_size or plan.world_size) not in (4, 8, 16) or (
+            plan.context_parallel_size or plan.world_size) > plan.world_size:
+        raise ValueError("Kimi K3.1 supports DCP4, DCP8 or DCP16 within its tensor-parallel size")
     if plan.speculation is not None and plan.speculation.method == "dflash2":
         if plan.speculation.markov_head_quantization is not None:
             raise ValueError("DFlash2 has no Markov transition head")
@@ -51,12 +57,15 @@ RECIPE = Recipe(
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64),
     max_draft_tokens=7, verification_rows=0, max_images=4, image_bytes=32 << 20,
-    online_mxfp8=True, online_mxfp8_scope="kda-input", online_mxfp8_scopes=("all", "kda-input"),
+    online_mxfp8=True, online_mxfp8_scope="kda-input", online_mxfp8_scopes=("all", "kda-input", "kda-all"),
+    inspect_replacement=_inspect_exl3_replacement,
     draft_head_quantizations=("mxfp8", "nvfp4"), draft_body_quantizations=("mxfp8",),
     markov_head_quantizations=("fp8",),
     speculative_methods=MappingProxyType({"dflash2": SpeculativeMethod(MappingProxyType({
+        8: RankCosts(state_row_bytes=68_710_400, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128*8),
         16: RankCosts(state_row_bytes=35_450_112, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128*16),
     }), draft_bytes=5_569_622_016), "dspark": SpeculativeMethod(MappingProxyType({
+        8: RankCosts(state_row_bytes=68_055_296, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128*8),
         16: RankCosts(state_row_bytes=35_122_432, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128*16),
     }), draft_bytes=7_625_920_512)}),
     stream_overlap=True, language_model_only=True,
@@ -64,11 +73,15 @@ RECIPE = Recipe(
     # The DCP-only reduction shrinks from 14 MiB to 512 KiB at C4/W8. Two staging slots with
     # 30 shards release 849,346,560 bytes; let the planner consume at most 64 pages and retain the rest.
     hybrid_context_parallel_graph_credits=MappingProxyType({(16, 8): (849_346_560, 64)}),
-    benchmark_world_sizes=(16,),
+    benchmark_world_sizes=(8, 16),
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0", "B12X_PCIE_DCP_BLOCK_LIMIT": "0"}),
     # Graph storage is a planning allowance; actual graph memory is reported after preparation.
-    ranks=MappingProxyType({16: RankCosts(state_row_bytes=33_238_272, page_bytes=2_912_256,
-        graph_bytes=9 << 29, page_tokens=128 * 16)}),
-    plain_ranks=MappingProxyType({16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976,
-        graph_bytes=9 << 29, page_tokens=128 * 16)}),
+    ranks=MappingProxyType({
+        8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_912_256, graph_bytes=3 << 29, page_tokens=128 * 8),
+        16: RankCosts(state_row_bytes=33_238_272, page_bytes=2_912_256, graph_bytes=9 << 29, page_tokens=128 * 16),
+    }),
+    plain_ranks=MappingProxyType({
+        8: RankCosts(state_row_bytes=58_361_088, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128 * 8),
+        16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128 * 16),
+    }),
 )

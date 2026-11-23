@@ -61,7 +61,7 @@ class PreparedRouteGather:
         self.latent, self.weights, self.ids = latent, weights, ids
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         requests = []
-        self.combined = rows == 1 or (2 <= rows <= MAX_ROWS and world == 16)
+        self.combined = rows == 1 or (2 <= rows <= MAX_ROWS and world in (8, 16))
         if self.combined:
             self.fused = dict(local_down=local_down, local_router=local_router, correction_bias=correction_bias,
                               out_down=latent, topk_weights=weights, topk_ids=ids)

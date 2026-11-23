@@ -117,7 +117,7 @@ def metadata_config(monkeypatch):
 
 
 @pytest.mark.parametrize("scope,online", [
-    (None, True), ("all", True), ("kda-input", True), ("all", False), ("kda-input", False),
+    (None, True), ("all", True), ("kda-input", True), ("kda-all", True), ("all", False), ("kda-input", False), ("kda-all", False),
 ])
 def test_scope_selects_actual_loader_projection_groups(metadata_config, scope, online):
     options = {} if scope is None else {"online_mxfp8_scope": scope}
@@ -130,12 +130,14 @@ def test_scope_selects_actual_loader_projection_groups(metadata_config, scope, o
         converted = {name for name, value in layer["attention"].items() if isinstance(value, Converted)}
         expected = ({"input", "forget", "output"} if kind == "kda"
                     else {"latent_gate", "q_b", "output"}) if broad else (
-                        {"input"} if online and kind == "kda" else set())
+                        ({"input", "output"} if scope == "kda-all" else {"input"})
+                        if online and kind == "kda" else set())
         assert converted == expected
         assert all(not layer["attention"][name].retain_scale_rows for name in converted)
         assert all(isinstance(value, Converted) == broad for value in layer["shared"].values())
         assert all(isinstance(layer[name], Converted) == broad
-                   for name in ("latent_down", "latent_down_rows", "latent_up"))
+                   for name in ("latent_down_rows", "latent_up"))
+        assert "latent_down" not in layer
         assert layer["router"].dtype == torch.bfloat16
         assert layer["experts"] == "experts"
         if kind == "dsa":
@@ -148,7 +150,7 @@ def test_scope_selects_actual_loader_projection_groups(metadata_config, scope, o
 
 @pytest.mark.parametrize("scope", ["", "attention", None, 3])
 def test_loader_rejects_unknown_scope_before_checkpoint_access(scope):
-    with pytest.raises(ValueError, match="online MXFP8 scope must be all or kda-input"):
+    with pytest.raises(ValueError, match="online MXFP8 scope must be all, kda-input, or kda-all"):
         weights.KimiWeightLoader(None, "meta", shard=TensorParallelShard(0, 16),
                                  online_mxfp8_scope=scope)
 

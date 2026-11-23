@@ -21,7 +21,7 @@ from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.mlp import MLPScratch
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
-from ignition.preparation.examples import declaration_tensor
+from hyperflare_recipes.recipes.kimi3.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 from hyperflare_recipes.recipes.kimi3.attention import PreparedMLAProjection
 from hyperflare_recipes.recipes.kimi3.config import PAGE_TOKENS

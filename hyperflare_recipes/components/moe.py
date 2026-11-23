@@ -226,10 +226,25 @@ class PreparedRoutedExperts:
             # A plan can keep alternate scale layouts beside its canonical planes.
             for field in ("w13_scale", "w2_scale", "w13_sfb", "w2_sfb",
                           "w13_global_scale", "w2_global_scale", "micro_w13_scale", "micro_w2_scale",
-                          "micro_w13_global_scale", "micro_w2_global_scale"):
+                          "micro_w13_global_scale", "micro_w2_global_scale", "gate_suh", "up_suh",
+                          "intermediate_rotations", "intermediate_sign_table",
+                          "intermediate_sign_patterns", "down_svh", "fc1_trellis_pair_modes",
+                          "fc2_trellis_pair_modes"):
                 tensor = getattr(representation.value, field, None)
                 if tensor is not None:
                     record_numeric_tensor(tensor)
+            if getattr(representation.value, "trellis", None) is not None:
+                from b12x._lib.quant.lut_e4m3 import (
+                    lut_e4m3_direct_table_resident,
+                    lut_e4m3_value_table_resident,
+                )
+
+                for lut in (
+                    lut_e4m3_direct_table_resident(experts.device),
+                    lut_e4m3_value_table_resident(experts.device),
+                ):
+                    if lut is not None:
+                        record_numeric_tensor(lut)
         decoder = experts._impl.nvfp4_csf
         if decoder is not None:
             # Compressed records contain numeric offsets, not device pointers.

@@ -9,7 +9,12 @@ from dataclasses import dataclass
 import torch
 import triton
 
-from ignition.components.collectives import ConcurrentAllReduce, PreparedChunkedAllGather, PreparedChunkedAllReduce
+from ignition.components.collectives import (
+    ConcurrentAllReduce,
+    ConcurrentChunkedAllReduce,
+    PreparedChunkedAllGather,
+    PreparedChunkedAllReduce,
+)
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
@@ -18,7 +23,7 @@ from hyperflare_recipes.components.column_pair_gather import PreparedColumnPairG
 from hyperflare_recipes.components.recurrent import DeltaMetadata, _commit_convolution
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 from hyperflare_recipes.components.kda_speculation import KDARecords, PreparedKDAReplay
-from ignition.preparation.examples import declaration_tensor
+from .examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import register_finalizer
@@ -315,7 +320,7 @@ class PreparedLatentMoE:
             parallel_plans=shared_parallel, examples=examples)
         self.concurrent_expert_reduce = None
         self.all_plans = ()
-        if self.pipelined and len(self.expert_reduce.parts) == 1:
+        if self.pipelined:
             self.all_plans = (
                 self.router_projection.plan,
                 self.down.plan,
@@ -327,11 +332,14 @@ class PreparedLatentMoE:
             )
             self.prefill_route_gather.enable_concurrent(
                 workspace=workspace, session=session, parallel_plans=self.all_plans)
-            self.concurrent_expert_reduce = ConcurrentAllReduce(
-                self.expert_reduce.parts[0], workspace=workspace, session=session,
-                parallel_plans=self.all_plans)
-        else:
-            self.pipelined = False
+            if len(self.expert_reduce.parts) == 1:
+                self.concurrent_expert_reduce = ConcurrentAllReduce(
+                    self.expert_reduce.parts[0], workspace=workspace, session=session,
+                    parallel_plans=self.all_plans)
+            else:
+                self.concurrent_expert_reduce = ConcurrentChunkedAllReduce(
+                    self.expert_reduce.parts, self.expert_reduce.bounds, workspace=workspace,
+                    session=session, parallel_plans=self.all_plans)
         self.expert_reduce.functional(session=session)
         if self.concurrent_expert_reduce is not None:
             self.concurrent_expert_reduce.functional(session=session)
@@ -445,20 +453,31 @@ class PreparedDecoder:
             else:
                 mlp = PreparedLatentMoE(w, source, config, weights.shard, runtime=runtime,
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
-                    prefill_route_runtime=prefill_route_runtime if mode == "prefill" else None,
+                    prefill_route_runtime=prefill_route_runtime if (mode == "prefill" or tokens > ROUTE_ROWS) else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace, storage=buffers, examples=examples)
             total = declaration_tensor(examples, "kimi.hidden_output", source.shape, source.dtype, source.device)
             reduce = PreparedChunkedAllReduce(source, total, runtime=runtime, coordinator=coordinator,
                 session=session, name=prefix + ".reduce")
             concurrent_reduce = None
+            mid = len(reduce.parts) // 2
             if (mode == "prefill" and tokens == 2048 and isinstance(mlp, PreparedLatentMoE)
-                    and mlp.pipelined and len(reduce.parts) == 2 and workspace is not None and workspace.overlap):
-                concurrent_reduce = (
-                    ConcurrentAllReduce(reduce.parts[0], workspace=workspace, session=session,
-                        parallel_plans=mlp.all_plans),
-                    ConcurrentAllReduce(reduce.parts[1], workspace=workspace, session=session,
-                        parallel_plans=mlp.all_plans),
-                )
+                    and mlp.pipelined and len(reduce.parts) >= 2 and len(reduce.parts) % 2 == 0
+                    and reduce.bounds[mid][0] == tokens // 2
+                    and workspace is not None and workspace.overlap):
+                if mid == 1:
+                    concurrent_reduce = (
+                        ConcurrentAllReduce(reduce.parts[0], workspace=workspace, session=session,
+                            parallel_plans=mlp.all_plans),
+                        ConcurrentAllReduce(reduce.parts[1], workspace=workspace, session=session,
+                            parallel_plans=mlp.all_plans),
+                    )
+                else:
+                    concurrent_reduce = (
+                        ConcurrentChunkedAllReduce(reduce.parts[:mid], reduce.bounds[:mid],
+                            workspace=workspace, session=session, parallel_plans=mlp.all_plans),
+                        ConcurrentChunkedAllReduce(reduce.parts[mid:], reduce.bounds[mid:],
+                            workspace=workspace, session=session, parallel_plans=mlp.all_plans),
+                    )
             reduce.functional(session=session)
             if concurrent_reduce is not None:
                 concurrent_reduce[0].functional(session=session)
@@ -558,10 +577,11 @@ class PreparedDecoder:
                 # 2-half (1024 + 1024) SM<->PCIe pipeline: overlaps attn_reduce(B), route_gather(A/B),
                 # expert_reduce(A/B), and mlp_reduce(A) with independent main-stream compute (strictly 1 collective in flight).
                 h = self.tokens // 2
+                mid = len(reduce.parts) // 2
                 cr0, cr1 = concurrent_reduce
                 att_mode = REPLACE if boundary else ADD
                 att_sources = committed + boundary
-                att_A = reduce.parts[0](attended[:h])
+                att_A = reduce(attended[:h], parts=(0, mid))
                 p_att_B = cr1.start(attended[h:], dependencies=(att_A,))
                 hidden_A = ResidualStream(residual.prefix[:h], residual.blocks[:h],
                     torch.empty((h, self.hidden), dtype=attended.dtype, device=attended.device)).mix(
@@ -606,7 +626,7 @@ class PreparedDecoder:
 
                 delta = torch.empty((self.tokens, self.hidden), dtype=attended.dtype, device=attended.device)
                 delta[:h].copy_(delta_A)
-                reduce.parts[1](out_B, delta[h:], dependencies=(delta_A,))
+                reduce(out_B, delta[h:], parts=(mid, len(reduce.parts)), dependencies=(delta_A,))
                 preceding_addend = None
                 mode = ADD
                 continue

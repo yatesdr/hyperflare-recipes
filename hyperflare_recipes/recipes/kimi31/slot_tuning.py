@@ -185,21 +185,42 @@ def _measure(trial, bindings, session, namespace):
             graph.reset()
         for forward in compiled.values():
             forward.retire_after_capture()
+        graphs.clear()
+        compiled.clear()
+        trial.expected.clear()
+        trial.patterns.clear()
+        trial.values.clear()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
-def tune_local_slots(registry, session):
+def tune_local_slots(registry, session, *, transient=None):
+    from contextlib import nullcontext
+    import gc
+
+    scope = nullcontext if transient is None else transient
     namespace = session.namespace.to_dict()
     checkpoint, schema, numerics = (namespace.pop(key) for key in ("checkpoint", "workload_schema", "numerical_policy"))
-    with RecordedPreparationSession(device=registry.context.shards.index.device, checkpoint=checkpoint,
-            workload_schema=schema, numerical_policy=numerics, namespace=namespace,
-            coordinator=registry.context.coordinator, compile_workers=session.requested_compile_workers,
-            autotune_effort=session.autotune_effort,
-            headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks) as trials:
-        grouped = {}
-        for geometry, bindings in registry.slot_groups.items():
-            for local, merge in bindings:
-                grouped.setdefault((geometry, merge.implementation), []).append((local, merge))
-        fixtures = [(SlotTrial(registry.context, registry.reduction, geometry, control, trials, f"slot_trial.{index}"),
-                     bindings) for index, ((geometry, control), bindings) in enumerate(grouped.items())]
-        trials.tune(show_progress=False)
-        return [_measure(trial, bindings, trials, registry.cache_root) for trial, bindings in fixtures]
+    grouped = {}
+    for geometry, bindings in registry.slot_groups.items():
+        for local, merge in bindings:
+            grouped.setdefault((geometry, merge.implementation), []).append((local, merge))
+    results = []
+    device = registry.context.shards.index.device
+    for index, ((geometry, control), bindings) in enumerate(grouped.items()):
+        with scope():
+            with RecordedPreparationSession(device=device, checkpoint=checkpoint,
+                    workload_schema=schema, numerical_policy=numerics, namespace=namespace,
+                    coordinator=registry.context.coordinator, compile_workers=session.requested_compile_workers,
+                    autotune_effort=session.autotune_effort,
+                    headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks) as trials:
+                trial = SlotTrial(registry.context, registry.reduction, geometry, control, trials, f"slot_trial.{index}")
+                trials.tune(show_progress=False)
+                results.append(_measure(trial, bindings, trials, registry.cache_root))
+                del trial
+            gc.collect()
+            torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+    return results

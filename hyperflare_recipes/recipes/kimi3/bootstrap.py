@@ -127,8 +127,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("Kimi draft body conversion must be omitted or mxfp8")
         if self.draft_body_quantization is not None and not self.drafting:
             raise ValueError("Kimi draft body conversion requires draft weights")
-        if self.online_mxfp8_scope not in ("all", "kda-input"):
-            raise ValueError("online MXFP8 scope must be all or kda-input")
+        if self.online_mxfp8_scope not in ("all", "kda-input", "kda-all"):
+            raise ValueError("online MXFP8 scope must be all, kda-input, or kda-all")
         if self.online_mxfp8_scope != "all" and not self.online_mxfp8:
             raise ValueError("online MXFP8 scope requires online conversion")
         if self.speculative_widths and max(self.speculative_widths) > 8:
@@ -143,10 +143,11 @@ class PreparationConfig(BasePreparationConfig):
                 raise ValueError("image concurrency must be zero or omitted when vision is disabled")
             images = 0
         object.__setattr__(self, "image_concurrency", images)
-        if len(self.devices) != 16 or len(set(self.devices)) != 16 or any(d < 0 for d in self.devices):
-            raise ValueError("Kimi K3 preparation requires sixteen distinct GPUs")
-        if self.context_parallel_size not in (4, 8, 16):
-            raise ValueError("Kimi TP16 context parallelism requires DCP4, DCP8 or DCP16")
+        if (len(self.devices) not in (8, 16) or len(set(self.devices)) != len(self.devices)
+                or any(d < 0 for d in self.devices)):
+            raise ValueError("Kimi preparation requires eight or sixteen distinct GPUs")
+        if self.context_parallel_size not in (4, 8, 16) or self.context_parallel_size > len(self.devices):
+            raise ValueError("Kimi context parallelism requires DCP4, DCP8, or DCP16 within the GPU count")
         request_capacity(self.max_active)
         selection = self.benchmark_selection
         if selection is not None:
@@ -246,6 +247,7 @@ def _benchmark_state(buffers, pool, requests, speculation):
 def _register_speculative_graphs(speculation, shapes, inputs, register):
     """Register every packed graph with its own draft vocabulary prefix."""
     from functools import partial
+    import gc
     from hyperflare_recipes.components.parallel_draft import PreparedParallelDraftRound
 
     for batch, width, packed in sorted(shapes, key=lambda shape: (shape[2], shape[0]), reverse=True):
@@ -260,6 +262,8 @@ def _register_speculative_graphs(speculation, shapes, inputs, register):
         operation.prepare()
         register(name, operation, "speculative", batch, width, (*inputs.buffers(), "sampling_grammar_mask"),
                  enabled=True, packed_tokens=packed)
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -317,9 +321,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
+        is_exl3 = weights.config.text.get("quantization_config", {}).get("quant_method") == "exl3"
         # Prefill activations reduce in chunks of the rows decode and verification already need a channel for: a
-        # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows.
-        channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
+        # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows. Tight-VRAM TP8 EXL3
+        # uses 256-row chunks with ConcurrentChunkedAllReduce to preserve the 1024+1024 prefill overlap.
+        reduce_rows = 256 if is_exl3 and shard.world_size <= 8 else REDUCE_ROWS
+        channel_rows = max(min(max_tokens, reduce_rows), config.decode_tokens)
         collective = create_all_reduce_runtime(group, device, max_tokens=channel_rows,
             hidden_size=weights.config.hidden, ipc=core_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
@@ -343,9 +350,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             elif config.markov_head_quantization is None:
                 markov_collective = create_all_gather_runtime(group, device, max_rows=slots,
                     columns=2 * weights.config.vocabulary, ipc=core_storage.peer_storage)
-        router_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
-            columns=2 * shard.world_size * ((weights.config.text["num_experts"] // shard.world_size + 31) // 32 * 32),
-            ipc=core_storage.peer_storage)
+        router_collective = (None if shard.world_size > 1 else
+            create_all_gather_runtime(group, device, max_rows=channel_rows,
+                columns=2 * shard.world_size * ((weights.config.text["num_experts"] // shard.world_size + 31) // 32 * 32),
+                ipc=core_storage.peer_storage))
         route_collective = (create_route_runtime(group, device, ipc=core_storage.peer_storage)
                             if shard.world_size > 1 else None)
         prefill_route_collective = (create_head_exchange(group, device, max_rows=channel_rows,
@@ -377,9 +385,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             if weights.config.dsa is not None:
                 from hyperflare_recipes.recipes.kimi31.dcp import AttentionConstants, ContextParallel, PREFILL_ROWS
 
-                extra["attention_constants"] = AttentionConstants.allocate(device, query_capacity=config.decode_tokens)
+                dsa_prefill_rows = 64 if is_exl3 and shard.world_size <= 8 else PREFILL_ROWS
+                extra["prefill_rows"] = dsa_prefill_rows
+                extra["attention_constants"] = AttentionConstants.allocate(
+                    device, query_capacity=config.decode_tokens, prefill_rows=dsa_prefill_rows)
                 extra["candidates"] = create_head_exchange(dcp_group, device,
-                    max_rows=max(min(config.prefill_chunk_size, PREFILL_ROWS), config.decode_tokens),
+                    max_rows=max(min(config.prefill_chunk_size, dsa_prefill_rows), config.decode_tokens),
                     heads=config.context_parallel_size, head_dim=8192, ipc=dcp_ipc)
                 if drafting and config.compile_decoder and config.autotune_effort != "off":
                     from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
@@ -391,7 +402,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                         topk=2048, stream_affine=False, ipc=dcp_ipc)
                     if config.prefill_chunk_size >= 2 * config.context_parallel_size:
                         extra["published_candidates"] = PublishedCandidateStorage(dcp_group, device,
-                            min(config.prefill_chunk_size, PREFILL_ROWS), 2048, ipc=dcp_ipc)
+                            min(config.prefill_chunk_size, dsa_prefill_rows), 2048, ipc=dcp_ipc)
             # Each DCP group gathers the TP16 head partition owned by that group and combines its partial outputs.
             heads = weights.config.text["num_attention_heads"]
             context = ContextParallel(ContextShards.on(dcp_rank, config.context_parallel_size, device),
@@ -436,9 +447,28 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,
                                  restore=pool.clear_for_preparation)
+        if drafting and slots + 1 != pool.reserved_backing.shape[0]:
+            spec_backing = pool.reserved_backing[:slots + 1]
+            register_benchmark_state(session, spec_backing, storage=spec_backing,
+                                     restore=pool.clear_for_preparation)
         arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
-        examples = {}
+        from .examples import ExampleArena
+        _example_arena = ExampleArena(
+            device,
+            800 << 20,
+            namespace_bases={
+                "vision": (0, 800 << 20),
+                "common": (0, 416 << 20),
+                "kda": (416 << 20, 800 << 20),
+                "dsa": (416 << 20, 800 << 20),
+            },
+        )
+        examples = {
+            "__arena__": _example_arena,
+            "index": {"__arena__": _example_arena},
+            "selected_attention": {"__arena__": _example_arena},
+        }
         deferred_pool = core_storage.scratch_pool()
         patches = PATCH_CAPACITIES if config.vision and config.benchmark_selection is None else ()
         prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, weights.config,
@@ -463,7 +493,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             # Uploads and published image features are unused by private tuning
             # fixtures. Retain addresses while releasing their physical backing.
             with deferred_pool:
-                vision_inputs = VisionInputs.allocate(device)
+                vision_inputs = VisionInputs.allocate(device, max_patches=patches[-1])
                 vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency,
                                            image_token=163605, features=FEATURES, hidden=HIDDEN // shard.world_size)
         vision_buffers = {} if not patches else {**vision_inputs.buffers(), **vision_prefill.buffers()}
@@ -477,11 +507,23 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
     decoder_buffers = DecoderStorage.allocate(weights.config, shard, device)
-    if (config.compile_decoder and shard.world_size == 16 and
-            getattr(collective, "algorithm", None) == "hierarchical"):
-        from .row_reductions import RowReductionTuning
-        decoder_buffers = replace(decoder_buffers, row_tuning=RowReductionTuning(
-            coordinator, device, weights.config.text["rms_norm_eps"], config.kernel_cache))
+    if config.compile_decoder and (
+        (shard.world_size == 16 and getattr(collective, "algorithm", None) == "hierarchical")
+        or (shard.world_size == 8 and getattr(collective, "algorithm", None) == "oneshot")
+    ):
+        from .row_reductions import (
+            RowReductionTuning,
+            get_tp8_ro_mix7168_launcher,
+            get_tp8_ro_norm3584_launcher,
+            get_tp8_ro_resnorm7168_launcher,
+        )
+        if shard.world_size == 16 or (
+            get_tp8_ro_mix7168_launcher is not None
+            and get_tp8_ro_norm3584_launcher is not None
+            and get_tp8_ro_resnorm7168_launcher is not None
+        ):
+            decoder_buffers = replace(decoder_buffers, row_tuning=RowReductionTuning(
+                coordinator, device, weights.config.text["rms_norm_eps"], config.kernel_cache))
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     if config.benchmark_selection is not None:
         prefill_sizes = config.benchmark_selection.prefill_capacities(config.prefill_chunk_size)
@@ -551,9 +593,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
 
             for capacity in reversed(patches):
                 name = f"vision{capacity}"
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, examples=examples)
+                vision_storage[capacity] = VisionScratch.allocate(
+                    capacity, device, examples=examples,
+                    tp_size=weights.vision.tp_size, local_heads=weights.vision.local_heads,
+                )
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
-                    session=session, workspace=arena, name=name)
+                    session=session, workspace=arena, name=name,
+                    runtime=collective, coordinator=coordinator)
                 forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence,
                                                     feature_range=shard.partition(HIDDEN))
                 add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
@@ -585,11 +631,23 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         # driver-free VRAM for trial graph capture and forward compiler workers.
         if speculation is not None:
             speculation.release_examples()
-        examples.clear()
+        def _clear_nested(mapping):
+            for _val in list(mapping.values()):
+                if isinstance(_val, dict):
+                    _clear_nested(_val)
+            mapping.clear()
+        _clear_nested(examples)
         metadata.clear()
         vision_storage.clear()
-        prefill_storage = decode_storage = scratch = decoder = batch = encoder = m = None
+        prefill_storage = decode_storage = scratch = decoder = batch = encoder = m = forward = None
+        if context is not None:
+            context = replace(context, slab=None)
+            if weights.config.dsa is not None:
+                context = replace(context, staged_records=None, index_records=None)
+            collectives["context"] = context
         arena.release_preparation()
+        _example_arena.release()
+        _example_arena = None
         import gc
         gc.collect()
         torch.cuda.empty_cache()
@@ -599,14 +657,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                 tuning["row_reductions"] = decoder_buffers.row_tuning.tune(session)
 
         if context is not None and getattr(context, "selection_tuning", None) is not None:
-            with phase(progress, "Tune sparse candidate compositions"), core_storage.transient():
-                tuning["candidate_compositions"] = context.selection_tuning.tune(session)
+            with phase(progress, "Tune sparse candidate compositions"):
+                tuning["candidate_compositions"] = context.selection_tuning.tune(
+                    session, transient=core_storage.transient)
 
-        if context is not None:
-            context = replace(context, slab=None)
-            if weights.config.dsa is not None:
-                context = replace(context, staged_records=None, index_records=None)
-            collectives["context"] = context
         gc.collect()
         torch.cuda.empty_cache()
     except BaseException as error:
